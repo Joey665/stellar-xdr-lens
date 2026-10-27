@@ -63,7 +63,7 @@ recognise it, the way `AccountId` already renders as a strkey address.
 
 `pkg/lens/reason.go` maps all 208 protocol result codes to plain English. If an
 explanation is vague, wrong, or missing the advice you needed when you hit it,
-improving it is a genuinely valuable change.
+improving it is a genuinely valuable change. 
 
 Two rules, both enforced by tests:
 
@@ -84,7 +84,7 @@ Beyond that, ordinary idiomatic Go: small interfaces, errors wrapped with `%w`,
 
 Reflection is confined to `pkg/lens/node.go` by design. If you find yourself
 needing `reflect` elsewhere, that is a strong signal the change belongs in the
-node walker or an enricher instead.
+node walker or an enricher instead. 
 
 ### Tests
 

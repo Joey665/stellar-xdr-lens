@@ -457,3 +457,90 @@ func TestDiffFormatJSON(t *testing.T) {
 		}
 	})
 }
+
+func TestDiffFormatSummary(t *testing.T) {
+	t.Parallel()
+
+	stdout, _, err := run(t, "", "diff", "--format", "summary",
+		fixturePath("tx_soroban.res"), fixturePath("tx_failed.res"))
+	if err != nil {
+		t.Fatalf("diff --format summary error = %v", err)
+	}
+	// Should contain summary table with sections
+	for _, want := range []string{"SECTION", "ADDED", "REMOVED", "MODIFIED", "REORDERED", "TOTAL"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("--format summary output does not contain %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestDiffMaskPathsFlag(t *testing.T) {
+	t.Parallel()
+
+	// Use two envelopes that differ in SeqNum and Signatures
+	op := xdr.Operation{Body: xdr.OperationBody{
+		Type:           xdr.OperationTypeBumpSequence,
+		BumpSequenceOp: &xdr.BumpSequenceOp{BumpTo: xdr.SequenceNumber(7)},
+	}}
+	env1 := xdr.TransactionEnvelope{
+		Type: xdr.EnvelopeTypeEnvelopeTypeTx,
+		V1: &xdr.TransactionV1Envelope{
+			Tx: xdr.Transaction{
+				SourceAccount: xdr.MustMuxedAddress("GAPB7YMUQ6MPQ23PTFDNBZP7HGGTZPI2DT5JJURUOIXNPLGHW2O3WYXZ"),
+				Fee:           100,
+				SeqNum:        xdr.SequenceNumber(1),
+				Cond:          xdr.Preconditions{Type: xdr.PreconditionTypePrecondNone},
+				Memo:          xdr.Memo{Type: xdr.MemoTypeMemoNone},
+				Operations:    []xdr.Operation{op},
+				Ext:           xdr.TransactionExt{V: 0},
+			},
+			Signatures: []xdr.DecoratedSignature{
+				{Hint: xdr.SignatureHint{1, 1, 1, 1}, Signature: []byte{0xaa, 0xaa}},
+			},
+		},
+	}
+	env2 := xdr.TransactionEnvelope{
+		Type: xdr.EnvelopeTypeEnvelopeTypeTx,
+		V1: &xdr.TransactionV1Envelope{
+			Tx: xdr.Transaction{
+				SourceAccount: xdr.MustMuxedAddress("GAPB7YMUQ6MPQ23PTFDNBZP7HGGTZPI2DT5JJURUOIXNPLGHW2O3WYXZ"),
+				Fee:           100,
+				SeqNum:        xdr.SequenceNumber(999),
+				Cond:          xdr.Preconditions{Type: xdr.PreconditionTypePrecondNone},
+				Memo:          xdr.Memo{Type: xdr.MemoTypeMemoNone},
+				Operations:    []xdr.Operation{op},
+				Ext:           xdr.TransactionExt{V: 0},
+			},
+			Signatures: []xdr.DecoratedSignature{
+				{Hint: xdr.SignatureHint{2, 2, 2, 2}, Signature: []byte{0xbb, 0xbb}},
+			},
+		},
+	}
+
+	p1, err := xdr.MarshalBase64(env1)
+	if err != nil {
+		t.Fatalf("MarshalBase64: %v", err)
+	}
+	p2, err := xdr.MarshalBase64(env2)
+	if err != nil {
+		t.Fatalf("MarshalBase64: %v", err)
+	}
+
+	// Without mask, differences are reported
+	stdout, _, err := run(t, "", "diff", p1, p2)
+	if err != nil {
+		t.Fatalf("diff error = %v", err)
+	}
+	if strings.Contains(stdout, "no differences") {
+		t.Error("expected differences without mask")
+	}
+
+	// With mask-paths SeqNum,Signatures, diff should report no differences
+	stdout, _, err = run(t, "", "diff", "--mask-paths", "V1.Tx.SeqNum,V1.Signatures", p1, p2)
+	if err != nil {
+		t.Fatalf("diff --mask-paths error = %v", err)
+	}
+	if !strings.Contains(stdout, "no differences") {
+		t.Errorf("expected 'no differences' with mask-paths, got:\n%s", stdout)
+	}
+}

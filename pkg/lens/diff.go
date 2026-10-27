@@ -33,6 +33,18 @@ const (
 	ChangeReordered
 )
 
+// LedgerEntryTransitionType classifies high-level LedgerEntry state transitions.
+type LedgerEntryTransitionType string
+
+const (
+	// TransitionCreated indicates a LedgerEntry was created from scratch.
+	TransitionCreated LedgerEntryTransitionType = "created"
+	// TransitionUpdated indicates a LedgerEntry was updated in place.
+	TransitionUpdated LedgerEntryTransitionType = "updated"
+	// TransitionDeleted indicates a LedgerEntry was deleted.
+	TransitionDeleted LedgerEntryTransitionType = "deleted"
+)
+
 func (c ChangeOp) String() string {
 	switch c {
 	case ChangeModified:
@@ -134,6 +146,11 @@ type DiffOptions struct {
 	// MaskPaths excludes changes matching glob-like patterns (e.g. *.Signatures, Tx.SeqNum)
 	// from diff evaluation (#126).
 	MaskPaths []string
+	// Mask excludes matching paths from diff evaluation entirely. Unlike
+	// Filter which only narrows output, masked paths are never compared,
+	// so differences in masked paths do not affect the Equal() result.
+	// Patterns use the same glob syntax as Filter (*, ?, **, [index]).
+	Mask *PathFilter
 	// Threshold ignores scalar numeric differences below or equal to the given delta.
 	Threshold float64
 	// DiffThreshold is an alias for Threshold.
@@ -168,6 +185,21 @@ func DiffWithOptions(left, right *Value, options DiffOptions) (*DiffResult, erro
 	if left == nil || right == nil {
 		return nil, fmt.Errorf("%w: diff requires two decoded values", ErrInvalidArgument)
 	}
+	if len(options.MaskPaths) > 0 {
+		maskFromPaths, err := NewPathFilter(options.MaskPaths, nil)
+		if err != nil {
+			return nil, fmt.Errorf("invalid MaskPaths: %w", err)
+		}
+		if options.Mask == nil || options.Mask.Empty() {
+			options.Mask = maskFromPaths
+		} else {
+			combined, err := NewPathFilter(append(options.Mask.includes, options.MaskPaths...), options.Mask.excludes)
+			if err != nil {
+				return nil, fmt.Errorf("combining Mask and MaskPaths: %w", err)
+			}
+			options.Mask = combined
+		}
+	}
 	leftNode, rightNode := left.Node, right.Node
 	if options.Semantic {
 		var err error
@@ -197,6 +229,11 @@ func DiffWithOptions(left, right *Value, options DiffOptions) (*DiffResult, erro
 
 // diffNodesWithOptions walks two subtrees in parallel, appending changes as it goes.
 func diffNodesWithOptions(a, b *Node, path string, out *[]Change, options DiffOptions) {
+	// Check if this path is masked - if so, skip comparison entirely.
+	if options.Mask != nil && !options.Mask.Empty() && options.Mask.Matches(path) {
+		return
+	}
+
 	switch {
 	case a == nil && b == nil:
 		return
@@ -255,6 +292,19 @@ func diffNodesWithOptions(a, b *Node, path string, out *[]Change, options DiffOp
 // diffStructs compares two records field by field, preserving the field order
 // of the left-hand side so output reads top-to-bottom like the source.
 func diffStructsWithOptions(a, b *Node, path string, out *[]Change, options DiffOptions) {
+	// Special handling for Memo union type: compare semantically when both
+	// sides have a memo but different arms (e.g., MemoText "100" vs MemoId 100).
+	if isMemoStruct(a, b) {
+		diffMemoSemantic(a, b, path, out, options)
+		return
+	}
+
+	// Special handling for LedgerEntry: classify state transitions (created, updated, deleted).
+	if isLedgerEntryStruct(a, b) {
+		diffLedgerEntryTransition(a, b, path, out, options)
+		return
+	}
+
 	seen := make(map[string]bool, len(a.Children))
 
 	for _, ac := range a.Children {
@@ -269,6 +319,496 @@ func diffStructsWithOptions(a, b *Node, path string, out *[]Change, options Diff
 		}
 		diffNodesWithOptions(nil, bc, join(path, bc.Name), out, options)
 	}
+}
+
+// isMemoStruct reports whether the nodes represent a Memo union (XDR type "Memo").
+func isMemoStruct(a, b *Node) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.TypeName == "Memo" && b.TypeName == "Memo"
+}
+
+// diffMemoSemantic compares two Memo unions semantically, recognizing
+// equivalent content across different arms (e.g., MemoText "100" ~ MemoId 100).
+func diffMemoSemantic(a, b *Node, path string, out *[]Change, options DiffOptions) {
+	// Extract memo type and value from each side
+	leftType, leftVal := extractMemoArm(a)
+	rightType, rightVal := extractMemoArm(b)
+
+	if leftType == rightType {
+		// Same arm, do normal field-by-field comparison
+		diffStructsWithOptionsFallback(a, b, path, out, options)
+		return
+	}
+
+	// Different arms - check for semantic equivalence
+	if memoValuesEquivalent(leftType, leftVal, rightType, rightVal) {
+		// Semantically equivalent: report as a single modified change with a note
+		*out = append(*out, Change{
+			Path:       path,
+			Op:         ChangeModified,
+			Before:     leftVal,
+			After:      rightVal,
+			BeforeNote: fmt.Sprintf("%s (semantically equivalent to %s)", leftType, rightType),
+			AfterNote:  fmt.Sprintf("%s (semantically equivalent to %s)", rightType, leftType),
+		})
+		return
+	}
+
+	// Not equivalent - fall back to normal union diff (removal + addition)
+	diffStructsWithOptionsFallback(a, b, path, out, options)
+}
+
+// diffStructsWithOptionsFallback is the normal struct diff without memo special-casing.
+func diffStructsWithOptionsFallback(a, b *Node, path string, out *[]Change, options DiffOptions) {
+	seen := make(map[string]bool, len(a.Children))
+
+	for _, ac := range a.Children {
+		seen[ac.Name] = true
+		diffNodesWithOptions(ac, b.Child(ac.Name), join(path, ac.Name), out, options)
+	}
+	for _, bc := range b.Children {
+		if seen[bc.Name] {
+			continue
+		}
+		diffNodesWithOptions(nil, bc, join(path, bc.Name), out, options)
+	}
+}
+
+// extractMemoArm extracts the active arm from a Memo node.
+func extractMemoArm(n *Node) (string, any) {
+	if n == nil {
+		return "None", nil
+	}
+	for _, child := range n.Children {
+		if child.Kind != KindScalar {
+			continue
+		}
+		// Memo arms: Type (enum), Text, Id, Hash, Return, HashX
+		switch child.Name {
+		case "Type":
+			continue // We'll determine type from which value arm is present
+		case "Text", "Id", "Hash", "Return", "HashX":
+			if child.Value != nil {
+				return child.Name, child.Value
+			}
+		}
+	}
+	return "None", nil
+}
+
+// memoValuesEquivalent checks if two memo arms represent semantically equivalent values.
+// Currently recognizes: MemoText "N" == MemoId N (for numeric text).
+func memoValuesEquivalent(leftType string, leftVal any, rightType string, rightVal any) bool {
+	// MemoText "N" <-> MemoId N
+	if (leftType == "Text" && rightType == "Id") || (leftType == "Id" && rightType == "Text") {
+		var textVal string
+		var idVal any
+		if leftType == "Text" {
+			textVal = fmt.Sprintf("%v", leftVal)
+			idVal = rightVal
+		} else {
+			textVal = fmt.Sprintf("%v", rightVal)
+			idVal = leftVal
+		}
+		// Parse text as integer and compare with id
+		textNum, err := strconv.ParseUint(textVal, 10, 64)
+		if err != nil {
+			return false
+		}
+		idNum, ok := asNumber(idVal)
+		if !ok {
+			return false
+		}
+		return textNum == uint64(idNum)
+	}
+	return false
+}
+
+// LedgerEntryTransition represents the high-level state transition of a LedgerEntry.
+type LedgerEntryTransition string
+
+const (
+	LedgerEntryCreated LedgerEntryTransition = "CREATED"
+	LedgerEntryUpdated LedgerEntryTransition = "UPDATED"
+	LedgerEntryDeleted LedgerEntryTransition = "DELETED"
+	LedgerEntryUnknown LedgerEntryTransition = "UNKNOWN"
+)
+
+// String returns the string representation of the transition.
+func (t LedgerEntryTransition) String() string {
+	return string(t)
+}
+
+// isLedgerEntryStruct reports whether the nodes represent a LedgerEntry (XDR type "LedgerEntry").
+func isLedgerEntryStruct(a, b *Node) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.TypeName == "LedgerEntry" && b.TypeName == "LedgerEntry"
+}
+
+// diffLedgerEntryTransition classifies the state transition between two LedgerEntries
+// and adds a high-level transition header change before delegating to normal struct diff.
+func diffLedgerEntryTransition(a, b *Node, path string, out *[]Change, options DiffOptions) {
+	// First, do the detailed field-by-field diff to a temporary slice
+	var detailedChanges []Change
+	diffStructsWithOptionsFallback(a, b, path, &detailedChanges, options)
+
+	// Determine the transition type
+	transition := classifyLedgerEntryTransition(a, b)
+
+	// Only add transition header if there are actual detailed changes,
+	// or if the transition is CREATED/DELETED (structural changes).
+	// For UPDATED with no detailed changes, don't add a header (they're equal).
+	hasDetailedChanges := len(detailedChanges) > 0
+	isStructuralChange := transition == LedgerEntryCreated || transition == LedgerEntryDeleted
+
+	if hasDetailedChanges || isStructuralChange {
+		// Add a high-level transition change at the LedgerEntry path
+		*out = append(*out, Change{
+			Path:       path,
+			Op:         ChangeModified,
+			Before:     transition.String(),
+			After:      transition.String(),
+			BeforeNote: fmt.Sprintf("LedgerEntry transition: %s", transition),
+			AfterNote:  fmt.Sprintf("LedgerEntry transition: %s", transition),
+		})
+
+		// Also include the LedgerKey and entry type for context
+		ledgerKey := extractLedgerKey(a)
+		entryType := extractLedgerEntryType(a)
+		if ledgerKey != "" && entryType != "" {
+			*out = append(*out, Change{
+				Path:       path + ".LedgerKey",
+				Op:         ChangeModified,
+				Before:     ledgerKey,
+				After:      ledgerKey,
+				BeforeNote: fmt.Sprintf("%s (%s)", entryType, ledgerKey),
+				AfterNote:  fmt.Sprintf("%s (%s)", entryType, ledgerKey),
+			})
+		}
+	}
+
+	// Append the detailed changes
+	*out = append(*out, detailedChanges...)
+}
+
+// classifyLedgerEntryTransition determines whether a LedgerEntry was created, updated, or deleted.
+func classifyLedgerEntryTransition(a, b *Node) LedgerEntryTransition {
+	aHasData := hasLedgerEntryData(a)
+	bHasData := hasLedgerEntryData(b)
+
+	switch {
+	case !aHasData && bHasData:
+		return LedgerEntryCreated
+	case aHasData && !bHasData:
+		return LedgerEntryDeleted
+	case aHasData && bHasData:
+		// Both have data - classify as UPDATED (the detailed diff will show if there are actual changes)
+		return LedgerEntryUpdated
+	default:
+		return LedgerEntryUnknown
+	}
+}
+
+// hasLedgerEntryData reports whether a LedgerEntry node has its Data field populated.
+func hasLedgerEntryData(n *Node) bool {
+	if n == nil {
+		return false
+	}
+	for _, child := range n.Children {
+		if child.Name == "Data" && child.Kind == KindStruct {
+			// Check if Data has a non-None type (i.e., not empty/void)
+			for _, dc := range child.Children {
+				if dc.Name == "Type" && dc.Value != nil {
+					typeStr := fmt.Sprintf("%v", dc.Value)
+					if typeStr != "LedgerEntryTypeAccount" && typeStr != "" {
+						// Actually, even Account is valid data. Just check it's not empty.
+						return true
+					}
+					// All LedgerEntryType values indicate valid data
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// extractLedgerKey extracts a human-readable ledger key from a LedgerEntry node.
+func extractLedgerKey(n *Node) string {
+	if n == nil {
+		return ""
+	}
+	for _, child := range n.Children {
+		if child.Name == "Data" && child.Kind == KindStruct {
+			// The key depends on the entry type
+			for _, dc := range child.Children {
+				if dc.Name == "Type" && dc.Value != nil {
+					entryType := fmt.Sprintf("%v", dc.Value)
+					// Extract key based on entry type
+					switch entryType {
+					case "LedgerEntryTypeAccount":
+						return extractAccountKey(child)
+					case "LedgerEntryTypeTrustline":
+						return extractTrustlineKey(child)
+					case "LedgerEntryTypeOffer":
+						return extractOfferKey(child)
+					case "LedgerEntryTypeData":
+						return extractDataKey(child)
+					case "LedgerEntryTypeClaimableBalance":
+						return extractClaimableBalanceKey(child)
+					case "LedgerEntryTypeLiquidityPool":
+						return extractLiquidityPoolKey(child)
+					case "LedgerEntryTypeContractData":
+						return extractContractDataKey(child)
+					case "LedgerEntryTypeContractCode":
+						return extractContractCodeKey(child)
+					case "LedgerEntryTypeConfigSetting":
+						return extractConfigSettingKey(child)
+					case "LedgerEntryTypeTTL":
+						return extractTTLKey(child)
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// extractLedgerEntryType extracts the LedgerEntry type as a short string.
+func extractLedgerEntryType(n *Node) string {
+	if n == nil {
+		return ""
+	}
+	for _, child := range n.Children {
+		if child.Name == "Data" && child.Kind == KindStruct {
+			for _, dc := range child.Children {
+				if dc.Name == "Type" && dc.Value != nil {
+					typeStr := fmt.Sprintf("%v", dc.Value)
+					// Remove "LedgerEntryType" prefix for readability
+					return strings.TrimPrefix(typeStr, "LedgerEntryType")
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// Key extraction helpers for each LedgerEntry type
+
+func extractAccountKey(dataNode *Node) string {
+	for _, child := range dataNode.Children {
+		if child.Name == "Account" && child.Kind == KindStruct {
+			for _, ac := range child.Children {
+				if ac.Name == "AccountId" && ac.Value != nil {
+					return fmt.Sprintf("Account(%v)", ac.Value)
+				}
+			}
+		}
+	}
+	return "Account(<unknown>)"
+}
+
+func extractTrustlineKey(dataNode *Node) string {
+	var account, asset string
+	for _, child := range dataNode.Children {
+		if child.Name == "Trustline" && child.Kind == KindStruct {
+			for _, tc := range child.Children {
+				if tc.Name == "AccountId" && tc.Value != nil {
+					account = fmt.Sprintf("%v", tc.Value)
+				}
+				if tc.Name == "Asset" && tc.Kind == KindStruct {
+					asset = extractAssetSummary(tc)
+				}
+			}
+		}
+	}
+	if account != "" && asset != "" {
+		return fmt.Sprintf("Trustline(%s, %s)", account, asset)
+	}
+	return "Trustline(<unknown>)"
+}
+
+func extractOfferKey(dataNode *Node) string {
+	var sellerID string
+	var offerID uint64
+	for _, child := range dataNode.Children {
+		if child.Name == "Offer" && child.Kind == KindStruct {
+			for _, oc := range child.Children {
+				if oc.Name == "SellerID" && oc.Value != nil {
+					sellerID = fmt.Sprintf("%v", oc.Value)
+				}
+				if oc.Name == "OfferID" && oc.Value != nil {
+					if num, ok := asNumber(oc.Value); ok {
+						offerID = uint64(num)
+					}
+				}
+			}
+		}
+	}
+	if sellerID != "" {
+		return fmt.Sprintf("Offer(%s, #%d)", sellerID, offerID)
+	}
+	return "Offer(<unknown>)"
+}
+
+func extractDataKey(dataNode *Node) string {
+	var account, name string
+	for _, child := range dataNode.Children {
+		if child.Name == "Data" && child.Kind == KindStruct {
+			for _, dc := range child.Children {
+				if dc.Name == "AccountId" && dc.Value != nil {
+					account = fmt.Sprintf("%v", dc.Value)
+				}
+				if dc.Name == "DataName" && dc.Value != nil {
+					name = fmt.Sprintf("%v", dc.Value)
+				}
+			}
+		}
+	}
+	if account != "" && name != "" {
+		return fmt.Sprintf("Data(%s, %q)", account, name)
+	}
+	return "Data(<unknown>)"
+}
+
+func extractClaimableBalanceKey(dataNode *Node) string {
+	for _, child := range dataNode.Children {
+		if child.Name == "ClaimableBalance" && child.Kind == KindStruct {
+			for _, bc := range child.Children {
+				if bc.Name == "BalanceId" && bc.Value != nil {
+					return fmt.Sprintf("ClaimableBalance(%v)", bc.Value)
+				}
+			}
+		}
+	}
+	return "ClaimableBalance(<unknown>)"
+}
+
+func extractLiquidityPoolKey(dataNode *Node) string {
+	for _, child := range dataNode.Children {
+		if child.Name == "LiquidityPool" && child.Kind == KindStruct {
+			for _, lc := range child.Children {
+				if lc.Name == "LiquidityPoolId" && lc.Value != nil {
+					return fmt.Sprintf("LiquidityPool(%v)", lc.Value)
+				}
+			}
+		}
+	}
+	return "LiquidityPool(<unknown>)"
+}
+
+func extractContractDataKey(dataNode *Node) string {
+	var contract, key string
+	for _, child := range dataNode.Children {
+		if child.Name == "ContractData" && child.Kind == KindStruct {
+			for _, dc := range child.Children {
+				if dc.Name == "Contract" && dc.Value != nil {
+					contract = fmt.Sprintf("%v", dc.Value)
+				}
+				if dc.Name == "Key" && dc.Kind == KindStruct {
+					key = extractScValSummary(dc)
+				}
+			}
+		}
+	}
+	if contract != "" && key != "" {
+		return fmt.Sprintf("ContractData(%s, %s)", contract, key)
+	}
+	return "ContractData(<unknown>)"
+}
+
+func extractContractCodeKey(dataNode *Node) string {
+	for _, child := range dataNode.Children {
+		if child.Name == "ContractCode" && child.Kind == KindStruct {
+			for _, cc := range child.Children {
+				if cc.Name == "Hash" && cc.Value != nil {
+					return fmt.Sprintf("ContractCode(%v)", cc.Value)
+				}
+			}
+		}
+	}
+	return "ContractCode(<unknown>)"
+}
+
+func extractConfigSettingKey(dataNode *Node) string {
+	for _, child := range dataNode.Children {
+		if child.Name == "ConfigSetting" && child.Kind == KindStruct {
+			for _, cc := range child.Children {
+				if cc.Name == "ConfigSettingId" && cc.Value != nil {
+					return fmt.Sprintf("ConfigSetting(%v)", cc.Value)
+				}
+			}
+		}
+	}
+	return "ConfigSetting(<unknown>)"
+}
+
+func extractTTLKey(dataNode *Node) string {
+	for _, child := range dataNode.Children {
+		if child.Name == "TTL" && child.Kind == KindStruct {
+			for _, tc := range child.Children {
+				if tc.Name == "KeyHash" && tc.Value != nil {
+					return fmt.Sprintf("TTL(%v)", tc.Value)
+				}
+			}
+		}
+	}
+	return "TTL(<unknown>)"
+}
+
+func extractAssetSummary(assetNode *Node) string {
+	var assetType, code, issuer string
+	for _, child := range assetNode.Children {
+		if child.Name == "Type" && child.Value != nil {
+			assetType = fmt.Sprintf("%v", child.Value)
+		}
+		if child.Name == "AlphaNum4" && child.Kind == KindStruct {
+			for _, ac := range child.Children {
+				if ac.Name == "AssetCode" && ac.Value != nil {
+					code = fmt.Sprintf("%v", ac.Value)
+				}
+				if ac.Name == "Issuer" && ac.Value != nil {
+					issuer = fmt.Sprintf("%v", ac.Value)
+				}
+			}
+		}
+		if child.Name == "AlphaNum12" && child.Kind == KindStruct {
+			for _, ac := range child.Children {
+				if ac.Name == "AssetCode" && ac.Value != nil {
+					code = fmt.Sprintf("%v", ac.Value)
+				}
+				if ac.Name == "Issuer" && ac.Value != nil {
+					issuer = fmt.Sprintf("%v", ac.Value)
+				}
+			}
+		}
+	}
+	if assetType == "AssetTypeNative" || assetType == "LedgerEntryTypeNative" {
+		return "native"
+	}
+	if code != "" && issuer != "" {
+		return fmt.Sprintf("%s:%s", code, issuer)
+	}
+	return assetType
+}
+
+func extractScValSummary(n *Node) string {
+	if n == nil {
+		return ""
+	}
+	for _, arm := range []string{"Sym", "Str", "Address", "U32", "U64", "I32", "I64", "U128", "I128", "Bool", "Bytes"} {
+		if c := n.Child(arm); c != nil && c.Value != nil {
+			return fmt.Sprintf("%s:%v", arm, c.Value)
+		}
+	}
+	if n.Value != nil {
+		return fmt.Sprintf("%v", n.Value)
+	}
+	return ""
 }
 
 const maxAlignmentCells = 1 << 20
