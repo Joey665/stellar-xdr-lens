@@ -408,6 +408,208 @@ func stringerName(rv reflect.Value) (string, bool) {
 	return name, true
 }
 
+// FilterByAccount returns a new Node tree containing only nodes that reference
+// the given account strkey address (G...). It recursively walks the tree and
+// keeps nodes where an AccountID enricher matches the target, plus their
+// ancestors up to the root. If the target is empty, the original tree is
+// returned unchanged.
+func FilterByAccount(root *Node, targetAccount string) *Node {
+	if root == nil || targetAccount == "" {
+		return root
+	}
+	return filterByAccountRecursive(root, targetAccount, nil)
+}
+
+// filterByAccountRecursive walks the tree and marks nodes to keep.
+func filterByAccountRecursive(n *Node, targetAccount string, parent *Node) *Node {
+	if n == nil {
+		return nil
+	}
+
+	// Check if this node or any descendant matches the target account
+	matches := nodeOrDescendantMatchesAccount(n, targetAccount)
+
+	// Also check if this node itself is an AccountID or MuxedAccount that matches
+	if n.Kind == KindScalar && (n.Note == targetAccount || nodeValueEquals(n.Value, targetAccount)) && (n.TypeName == "AccountId" || n.TypeName == "MuxedAccount") {
+		matches = true
+	}
+
+	if !matches {
+		return nil
+	}
+
+	// Create a copy of this node with filtered children
+	newNode := &Node{
+		Name:     n.Name,
+		Kind:     n.Kind,
+		TypeName: n.TypeName,
+		Value:    n.Value,
+		Note:     n.Note,
+		Children: nil,
+	}
+
+	// Recursively filter children
+	for _, child := range n.Children {
+		filteredChild := filterByAccountRecursive(child, targetAccount, newNode)
+		if filteredChild != nil {
+			newNode.Children = append(newNode.Children, filteredChild)
+		}
+	}
+
+	return newNode
+}
+
+// nodeOrDescendantMatchesAccount checks if a node or any of its descendants
+// contains an AccountID or MuxedAccount that matches the target account.
+func nodeOrDescendantMatchesAccount(n *Node, targetAccount string) bool {
+	if n == nil {
+		return false
+	}
+
+	// Check this node
+	if n.Kind == KindScalar && (n.Note == targetAccount || nodeValueEquals(n.Value, targetAccount)) && (n.TypeName == "AccountId" || n.TypeName == "MuxedAccount") {
+		return true
+	}
+
+	// Check children recursively
+	for _, child := range n.Children {
+		if nodeOrDescendantMatchesAccount(child, targetAccount) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// nodeValueEquals checks if a node's Value equals the target account string.
+func nodeValueEquals(value any, target string) bool {
+	if value == nil {
+		return false
+	}
+	if s, ok := value.(string); ok {
+		return s == target
+	}
+	return false
+}
+
+// FilterByOpType returns a new Node tree containing only operation nodes that
+// match the given operation type name (e.g., "payment", "invoke_host_function").
+// The match is case-insensitive and supports both snake_case and camelCase
+// variants. If opType is empty, the original tree is returned unchanged.
+func FilterByOpType(root *Node, opType string) *Node {
+	if root == nil || opType == "" {
+		return root
+	}
+	normalized := normalizeOpType(opType)
+	return filterByOpTypeRecursive(root, normalized)
+}
+
+// normalizeOpType converts operation type to a canonical form for comparison.
+func normalizeOpType(s string) string {
+	// Handle camelCase like "InvokeHostFunction" -> "invoke_host_function"
+	// Do this BEFORE ToLower so we can detect uppercase boundaries
+	var result strings.Builder
+	for i, r := range s {
+		if i > 0 && r >= 'A' && r <= 'Z' {
+			result.WriteByte('_')
+		}
+		result.WriteRune(r)
+	}
+	s = result.String()
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, "-", "_")
+	s = strings.ReplaceAll(s, " ", "_")
+	return s
+}
+
+func filterByOpTypeRecursive(n *Node, targetOpType string) *Node {
+	if n == nil {
+		return nil
+	}
+
+	// Check if this node is an operation list (TypeName may be empty)
+	if n.Kind == KindList && (n.TypeName == "Operation" || n.Name == "Operations") {
+		// Filter list elements
+		var filteredChildren []*Node
+		for _, child := range n.Children {
+			if opMatchesType(child, targetOpType) {
+				filteredChildren = append(filteredChildren, child)
+			}
+		}
+		if len(filteredChildren) == 0 {
+			return nil
+		}
+		newNode := &Node{
+			Name:     n.Name,
+			Kind:     n.Kind,
+			TypeName: n.TypeName,
+			Value:    n.Value,
+			Note:     n.Note,
+			Children: filteredChildren,
+		}
+		return newNode
+	}
+
+	// Check if this node is an operation struct
+	if n.Kind == KindStruct && n.TypeName == "Operation" {
+		if opMatchesType(n, targetOpType) {
+			return n
+		}
+		return nil
+	}
+
+	// Recursively filter children
+	var filteredChildren []*Node
+	for _, child := range n.Children {
+		filteredChild := filterByOpTypeRecursive(child, targetOpType)
+		if filteredChild != nil {
+			filteredChildren = append(filteredChildren, filteredChild)
+		}
+	}
+
+	if len(filteredChildren) == 0 && n.Kind != KindScalar {
+		// If no children match and this isn't a scalar, check if this node itself matches
+		if n.Kind == KindStruct && n.TypeName == "Operation" && opMatchesType(n, targetOpType) {
+			return n
+		}
+		return nil
+	}
+
+	newNode := &Node{
+		Name:     n.Name,
+		Kind:     n.Kind,
+		TypeName: n.TypeName,
+		Value:    n.Value,
+		Note:     n.Note,
+		Children: filteredChildren,
+	}
+
+	return newNode
+}
+
+func opMatchesType(opNode *Node, targetOpType string) bool {
+	if opNode == nil || opNode.Kind != KindStruct {
+		return false
+	}
+	// Find the "Body" field and then the "Type" field within it
+	bodyNode := opNode.Child("Body")
+	if bodyNode == nil {
+		return false
+	}
+	typeNode := bodyNode.Child("Type")
+	if typeNode == nil {
+		return false
+	}
+	// typeNode.Value should be the enum string like "OperationTypePayment"
+	if typeNode.Value == nil {
+		return false
+	}
+	typeStr := fmt.Sprintf("%v", typeNode.Value)
+	typeStr = strings.TrimPrefix(typeStr, "OperationType")
+	typeStr = normalizeOpType(typeStr)
+	return typeStr == targetOpType
+}
+
 // safeString calls String() while tolerating a panic. Generated XDR helpers
 // can dereference union arms that are absent in a malformed value, and this
 // tool is expected to survive hostile input rather than crash on it.

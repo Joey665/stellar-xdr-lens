@@ -14,11 +14,11 @@ around `opINNER` wrapped around `InvokeHostFunctionResultCodeInvokeHostFunctionT
 Working out *which operation* failed, *what it was trying to do*, and *what to
 do about it* means decoding two separate blobs and correlating them by hand.
 
-`lens` does that correlation for you:
+`lens` does that correlation for you: 
 
 ```console
 $ lens explain "$ENVELOPE" --result "$RESULT"
-Transaction failed at operation 0, invoke_host_function (call harvest on contract CBGSB…KKY3 with 2 argument(s)): The contract trapped: it panicked, or explicitly returned an error.
+Transaction failed at operation 0, invoke_host_function (call harvest on contract CBGSB…KKY3 with 2 argument(s)): The contract trapped: it panicked, or explicitly returned an error. 
 ```
 
 ### Honest scope: what already exists
@@ -354,6 +354,9 @@ $ lens decode --txrep --file envelope.xdr
 # Flat CSV row of the high-level transaction fields
 $ lens decode --csv --file envelope.xdr
 # or: lens decode --format csv --file envelope.xdr
+
+# JUnit XML test report for CI gatekeeping
+$ lens decode --format junit --file result.xdr > junit.xml
 
 # Interactive terminal tree explorer (TUI)
 $ lens decode -i --file envelope.xdr

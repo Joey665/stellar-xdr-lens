@@ -977,6 +977,19 @@ func TestDecodeNewFormatsAndCommands(t *testing.T) {
 		}
 	})
 
+	t.Run("decode --format junit", func(t *testing.T) {
+		stdout, _, err := run(t, "", "decode", "--format", "junit", fixture(t, "tx_success.res"))
+		if err != nil {
+			t.Fatalf("decode --format junit: %v", err)
+		}
+		if !strings.Contains(stdout, `<?xml version="1.0" encoding="UTF-8"?>`) {
+			t.Errorf("junit output is missing the XML declaration: %s", stdout)
+		}
+		if !strings.Contains(stdout, `<testsuite name="stellar-xdr-lens" tests="1" failures="0"`) {
+			t.Errorf("unexpected junit output: %s", stdout)
+		}
+	})
+
 	t.Run("explore command", func(t *testing.T) {
 		stdout, _, err := run(t, "q\n", "explore", fixturePayload)
 		if err != nil {
@@ -1162,4 +1175,144 @@ func TestEncodeCommand(t *testing.T) {
 			t.Errorf("decode|encode pipeline = %s, want %s", got, want)
 		}
 	})
+}
+
+func TestDecodeSelectFlag(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		args           []string
+		wantContain    []string
+		wantNotContain []string
+		wantError      bool
+	}{
+		{
+			name:           "select fee field",
+			args:           []string{"decode", "--file", fixturePath("tx_success.env"), "--select", "V1.Tx.Fee"},
+			wantContain:    []string{"58002"},
+			wantNotContain: []string{"TransactionEnvelope"},
+		},
+		{
+			name:        "select fee field with json",
+			args:        []string{"decode", "--file", fixturePath("tx_success.env"), "--select", "V1.Tx.Fee", "--json"},
+			wantContain: []string{"58002"},
+		},
+		{
+			name:           "select signatures with raw hex",
+			args:           []string{"decode", "--file", fixturePath("tx_success.env"), "--select", "V1.Signatures[0].Signature", "--raw", "--raw-format", "hex"},
+			wantContain:    []string{"9e9dfcffc2a451db2125c09ea8fa17e88af14fd044dee19f0453106ee5aab2df171177bf45c959ddc2c293a6bed1941d86d0b8a7ff93679931186800a0916703"},
+			wantNotContain: []string{"TransactionEnvelope"},
+		},
+		{
+			name:           "select signatures with raw base64",
+			args:           []string{"decode", "--file", fixturePath("tx_success.env"), "--select", "V1.Signatures[0].Signature", "--raw", "--raw-format", "base64"},
+			wantContain:    []string{"np38/8KkUdshJcCeqPoX6IrxT9BE3uGfBFMQbuWqst8XEXe/RclZ3cLCk6a+0ZQdhtC4p/+TZ5kxGGgAoJFnAw=="},
+			wantNotContain: []string{"TransactionEnvelope"},
+		},
+		{
+			name:        "query alias for select",
+			args:        []string{"decode", "--file", fixturePath("tx_success.env"), "--query", "V1.Tx.Fee"},
+			wantContain: []string{"58002"},
+		},
+		{
+			name:      "select invalid path fails",
+			args:      []string{"decode", "--file", fixturePath("tx_success.env"), "--select", "V1.Tx.NonExistent"},
+			wantError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			stdout, stderr, err := run(t, "", tc.args...)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("expected error for invalid path, got stdout: %s, stderr: %s", stdout, stderr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Execute() error = %v, stderr=%s", err, stderr)
+			}
+			for _, want := range tc.wantContain {
+				if !strings.Contains(stdout, want) {
+					t.Errorf("output does not contain %q\nstdout: %s\nstderr: %s", want, stdout, stderr)
+				}
+			}
+			for _, notWant := range tc.wantNotContain {
+				if strings.Contains(stdout, notWant) {
+					t.Errorf("output should not contain %q\nstdout: %s", notWant, stdout)
+				}
+			}
+		})
+	}
+}
+
+func TestDecodeAccountFilter(t *testing.T) {
+	t.Parallel()
+
+	account := "GCJNHFXJEQEY54NPKU4DBMT5WOBJUHMYSFBDAQF4OMTEGJN4BQU7ZST6"
+
+	stdout, _, err := run(t, "", "decode", "--file", fixturePath("tx_success.env"), "--account", account)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(stdout, account) {
+		t.Errorf("output does not contain account %q\n%s", account, stdout)
+	}
+	if !strings.Contains(stdout, "SourceAccount") {
+		t.Errorf("output does not contain SourceAccount\n%s", stdout)
+	}
+	// Should not contain unrelated fields
+	if strings.Contains(stdout, "Fee") || strings.Contains(stdout, "SeqNum") {
+		t.Errorf("output should only contain account-related nodes\n%s", stdout)
+	}
+}
+
+func TestDecodeOpTypeFilter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		opType         string
+		wantContain    []string
+		wantNotContain []string
+	}{
+		{
+			name:        "filter invoke_host_function",
+			opType:      "invoke_host_function",
+			wantContain: []string{"Operations", "InvokeHostFunction", "ContractAddress"},
+			// The filter keeps the path to the operation, so parent fields are still present
+		},
+		{
+			name:           "filter payment (case insensitive)",
+			opType:         "PAYMENT",
+			wantContain:    []string{},
+			wantNotContain: []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			args := []string{"decode", "--file", fixturePath("tx_success.env"), "--op-type", tc.opType}
+			stdout, _, err := run(t, "", args...)
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			for _, want := range tc.wantContain {
+				if !strings.Contains(stdout, want) {
+					t.Errorf("output does not contain %q\n%s", want, stdout)
+				}
+			}
+			for _, notWant := range tc.wantNotContain {
+				if strings.Contains(stdout, notWant) {
+					t.Errorf("output should not contain %q\n%s", notWant, stdout)
+				}
+			}
+		})
+	}
 }

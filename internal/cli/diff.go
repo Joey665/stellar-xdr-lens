@@ -26,9 +26,11 @@ func newDiffCmd(g *globalFlags, stdout io.Writer, stdin io.Reader) *cobra.Comman
 		semantic         bool
 		unorderedSigners bool
 		statsOnly        bool
+		summaryOnly      bool
 		footprintMode    bool
 		includePaths     []string
 		excludePaths     []string
+		maskPaths        []string
 		redact           []string
 		redactFields     []string
 		context          int
@@ -51,9 +53,9 @@ mismatched hash.
 Three modes change what is compared rather than how it is printed:
 
   --unordered-signers  treat signature and signer collections as unordered
-                       multisets, so reordering them is not a difference;
+                        multisets, so reordering them is not a difference;
   --footprint          compare the Soroban ledger footprints of two
-                       envelopes (or SorobanTransactionData) as sets;
+                        envelopes (or SorobanTransactionData) as sets;
   --stats              print only the statistical summary of the diff.
 
 --include-paths and --exclude-paths narrow which changed paths are reported.
@@ -62,6 +64,14 @@ a segment, ** spans segments, and a pattern also matches everything beneath it.
 Excludes win over includes. For example, ignoring the noise of a rebuild:
 
   lens diff --exclude-paths Signatures,SeqNum before.xdr after.xdr
+
+--mask-paths excludes matching paths from the diff evaluation entirely.
+Unlike --exclude-paths which only hides output, masked paths are never
+compared, so differences in masked paths do not affect the Equal() result.
+This is useful for ignoring dynamic fields like sequence numbers or signatures
+when checking if two transactions are semantically equivalent.
+
+  lens diff --mask-paths Signatures,SeqNum before.xdr after.xdr
 
 --redact normalizes the dynamic cryptographic values that a rebuild cannot
 reproduce — hashes, signatures and derived identifiers — before the comparison,
@@ -76,7 +86,7 @@ Three output formats render the difference for other tools:
   --unified      a standard unified diff for code review comments;
   --side-by-side a colourised two-column terminal view.
 
-These are mutually exclusive with each other and with --json/--stats.`,
+These are mutually exclusive with each other and with --json/--stats/--summary.`,
 		Example: `  lens diff "$XDR_A" "$XDR_B"
   lens diff before.xdr after.xdr
   lens diff --type TransactionEnvelope a.xdr b.xdr
@@ -85,6 +95,7 @@ These are mutually exclusive with each other and with --json/--stats.`,
   lens diff --unordered-signers a.xdr b.xdr
   lens diff --include-paths Result.Code a.xdr b.xdr
   lens diff --exclude-paths Signatures,SeqNum a.xdr b.xdr
+  lens diff --mask-paths Signatures,SeqNum a.xdr b.xdr
   lens diff --redact hashes,signatures a.xdr b.xdr
   lens diff --redact all --redact-fields PrevHash a.xdr b.xdr
   lens diff --footprint before.env.xdr after.env.xdr
@@ -92,6 +103,7 @@ These are mutually exclusive with each other and with --json/--stats.`,
   lens diff --unified a.xdr b.xdr
   lens diff --side-by-side a.xdr b.xdr
   lens diff --stats before.xdr after.xdr
+  lens diff --summary before.xdr after.xdr
   lens diff --diff-threshold 5 before.xdr after.xdr
   lens diff --exit-code a.xdr b.xdr   # non-zero when they differ`,
 		Args: cobra.ExactArgs(2),
@@ -113,12 +125,14 @@ These are mutually exclusive with each other and with --json/--stats.`,
 					sideBySide = true
 				case "stats":
 					statsOnly = true
+				case "summary":
+					summaryOnly = true
 				default:
-					return fmt.Errorf("%w: unknown format %q (allowed: text, json, json-patch, unified, side-by-side, stats)",
+					return fmt.Errorf("%w: unknown format %q (allowed: text, json, json-patch, unified, side-by-side, stats, summary)",
 						lens.ErrInvalidArgument, formatName)
 				}
 			}
-			if err := validateDiffModes(asJSON, statsOnly, jsonPatch, unified, sideBySide, footprintMode); err != nil {
+			if err := validateDiffModes(asJSON, statsOnly, summaryOnly, jsonPatch, unified, sideBySide, footprintMode); err != nil {
 				return err
 			}
 			if footprintMode && (len(includePaths) > 0 || len(excludePaths) > 0) {
@@ -127,6 +141,9 @@ These are mutually exclusive with each other and with --json/--stats.`,
 			}
 			if footprintMode && (len(redact) > 0 || len(redactFields) > 0) {
 				return fmt.Errorf("%w: --redact does not apply to --footprint", lens.ErrInvalidArgument)
+			}
+			if footprintMode && len(maskPaths) > 0 {
+				return fmt.Errorf("%w: --mask-paths does not apply to --footprint", lens.ErrInvalidArgument)
 			}
 
 			left, err := readOperand(args[0], stdin)
@@ -143,6 +160,11 @@ These are mutually exclusive with each other and with --json/--stats.`,
 			}
 
 			filter, err := lens.NewPathFilter(includePaths, excludePaths)
+			if err != nil {
+				return err
+			}
+
+			maskFilter, err := lens.NewPathFilter(maskPaths, nil)
 			if err != nil {
 				return err
 			}
@@ -166,6 +188,7 @@ These are mutually exclusive with each other and with --json/--stats.`,
 				Semantic:         semantic,
 				UnorderedSigners: unorderedSigners,
 				Filter:           filter,
+				Mask:             maskFilter,
 				Threshold:        diffThreshold,
 				Redaction:        redaction,
 			})
@@ -186,6 +209,17 @@ These are mutually exclusive with each other and with --json/--stats.`,
 					}
 				} else {
 					fmt.Fprintln(stdout, stats.String())
+				}
+			case summaryOnly:
+				palette, err := paletteForOutput(stdout, g.color)
+				if err != nil {
+					return err
+				}
+				f := format.NewDiffSummaryFormatter(
+					format.WithDiffSummaryPalette(palette),
+				)
+				if err := f.Format(stdout, result); err != nil {
+					return err
 				}
 			case jsonPatch:
 				leftValue, err := decodeValue(left, typeName)
@@ -271,7 +305,7 @@ These are mutually exclusive with each other and with --json/--stats.`,
 
 	cmd.Flags().StringVarP(&typeName, "type", "t", "",
 		"decode both values as this XDR type instead of detecting each")
-	cmd.Flags().StringVar(&formatName, "format", "", "output format: text, json, json-patch, unified, side-by-side, stats")
+	cmd.Flags().StringVar(&formatName, "format", "", "output format: text, json, json-patch, unified, side-by-side, stats, summary")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the diff as JSON")
 	cmd.Flags().BoolVar(&jsonPatch, "json-patch", false, "emit an RFC 6902 JSON Patch of the difference")
 	cmd.Flags().BoolVar(&unified, "unified", false, "emit a standard unified diff")
@@ -280,6 +314,8 @@ These are mutually exclusive with each other and with --json/--stats.`,
 		"only report changes matching these path patterns (comma-separated, repeatable)")
 	cmd.Flags().StringArrayVar(&excludePaths, "exclude-paths", nil,
 		"ignore changes matching these path patterns (comma-separated, repeatable)")
+	cmd.Flags().StringArrayVar(&maskPaths, "mask-paths", nil,
+		"exclude matching paths from diff evaluation entirely (comma-separated, repeatable)")
 	cmd.Flags().StringArrayVar(&redact, "redact", nil,
 		"normalize dynamic cryptographic values before diffing: hashes, signatures, identifiers or all")
 	cmd.Flags().StringArrayVar(&redactFields, "redact-fields", nil,
@@ -307,9 +343,9 @@ These are mutually exclusive with each other and with --json/--stats.`,
 // validateDiffModes rejects combinations of output modes that would otherwise
 // silently pick one. --stats --json is a single mode (the JSON statistics), so
 // it is allowed.
-func validateDiffModes(asJSON, statsOnly, jsonPatch, unified, sideBySide, footprint bool) error {
+func validateDiffModes(asJSON, statsOnly, summaryOnly, jsonPatch, unified, sideBySide, footprint bool) error {
 	modes := 0
-	if asJSON || statsOnly {
+	if asJSON || statsOnly || summaryOnly {
 		modes++
 	}
 	for _, on := range []bool{jsonPatch, unified, sideBySide} {
@@ -318,7 +354,7 @@ func validateDiffModes(asJSON, statsOnly, jsonPatch, unified, sideBySide, footpr
 		}
 	}
 	if modes > 1 {
-		return fmt.Errorf("%w: choose one of --json/--stats, --json-patch, --unified or --side-by-side", lens.ErrInvalidArgument)
+		return fmt.Errorf("%w: choose one of --json/--stats/--summary, --json-patch, --unified or --side-by-side", lens.ErrInvalidArgument)
 	}
 	if footprint && (jsonPatch || unified || sideBySide) {
 		return fmt.Errorf("%w: --footprint cannot be combined with --json-patch, --unified or --side-by-side", lens.ErrInvalidArgument)

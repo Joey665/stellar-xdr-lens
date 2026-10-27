@@ -1,6 +1,7 @@
 package lens
 
 import (
+	"fmt"
 	"math/big"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -12,6 +13,22 @@ import (
 // asset and address identifiers. Unsupported types retain structural behavior.
 func DiffSemantic(left, right *Value) (*DiffResult, error) {
 	return DiffWithOptions(left, right, DiffOptions{Semantic: true})
+}
+
+// SemanticMemoComparison evaluates whether two Memo variants carry equivalent payload
+// (e.g. MemoText "100" vs MemoId 100) and produces an informative semantic note (#127).
+func SemanticMemoComparison(left, right xdr.Memo) (equivalent bool, note string) {
+	if left.Type == xdr.MemoTypeMemoText && right.Type == xdr.MemoTypeMemoId {
+		if left.Text != nil && right.Id != nil && fmt.Sprintf("%d", *right.Id) == *left.Text {
+			return true, "memo content equivalent: MemoText matches MemoId numeric string"
+		}
+	}
+	if left.Type == xdr.MemoTypeMemoId && right.Type == xdr.MemoTypeMemoText {
+		if right.Text != nil && left.Id != nil && fmt.Sprintf("%d", *left.Id) == *right.Text {
+			return true, "memo content equivalent: MemoId matches MemoText numeric string"
+		}
+	}
+	return false, ""
 }
 
 func semanticScValInteger(value xdr.ScVal) (string, bool) {
