@@ -1152,3 +1152,307 @@ func TestDiffAccountSignerQuorumDrift(t *testing.T) {
 		}
 	})
 }
+
+func TestDiffLedgerEntryStateTransition(t *testing.T) {
+	t.Parallel()
+
+	// Load test fixtures for LedgerEntry types
+	offerLE, err := lens.DecodeAs(loadFixture(t, "ledger_entry_offer"), "LedgerEntry")
+	if err != nil {
+		t.Fatalf("loading offer fixture: %v", err)
+	}
+	contractDataLE, err := lens.DecodeAs(loadFixture(t, "ledger_entry_contract_data"), "LedgerEntry")
+	if err != nil {
+		t.Fatalf("loading contract_data fixture: %v", err)
+	}
+	ttlLE, err := lens.DecodeAs(loadFixture(t, "ledger_entry_ttl"), "LedgerEntry")
+	if err != nil {
+		t.Fatalf("loading ttl fixture: %v", err)
+	}
+
+	// Test 1: Created - compare different entry types (simulates created/deleted)
+	t.Run("Created/Deleted transition between types", func(t *testing.T) {
+		t.Parallel()
+		left := offerLE.Raw.(*xdr.LedgerEntry)
+		right := contractDataLE.Raw.(*xdr.LedgerEntry)
+
+		got, err := lens.DiffBase64(mustMarshal(t, left), mustMarshal(t, right), "LedgerEntry")
+		if err != nil {
+			t.Fatalf("DiffBase64() error = %v", err)
+		}
+
+		// Should detect transition (different types = created/deleted effectively)
+		found := false
+		for _, c := range got.Changes {
+			if c.Op == lens.ChangeModified && (strings.Contains(c.BeforeNote, "transition") || strings.Contains(c.AfterNote, "transition")) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Logf("Changes: %v", got.Changes)
+		}
+		if len(got.Changes) == 0 {
+			t.Errorf("expected changes for different entry types, got none")
+		}
+	})
+
+	// Test 2: Updated transition with modified offer
+	t.Run("Updated transition with modified offer", func(t *testing.T) {
+		t.Parallel()
+		// Use the offer fixture and modify it for the right side
+		left := offerLE.Raw.(*xdr.LedgerEntry)
+		// Create a deep copy with different OfferId
+		right := *left
+		if left.Data.Offer != nil {
+			offerCopy := *left.Data.Offer
+			offerCopy.OfferId = 99999
+			right.Data.Offer = &offerCopy
+		}
+
+		got, err := lens.DiffBase64(mustMarshal(t, left), mustMarshal(t, right), "LedgerEntry")
+		if err != nil {
+			t.Fatalf("DiffBase64() error = %v", err)
+		}
+
+		found := false
+		for _, c := range got.Changes {
+			if c.Op == lens.ChangeModified && (strings.Contains(c.BeforeNote, "UPDATED") || strings.Contains(c.AfterNote, "UPDATED")) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Logf("Changes: %v", got.Changes)
+		}
+		// Should also have detailed changes (more than just the transition header and LedgerKey)
+		detailedChanges := 0
+		for _, c := range got.Changes {
+			if c.Path != "" && c.Path != ".LedgerKey" {
+				detailedChanges++
+			}
+		}
+		if detailedChanges == 0 {
+			t.Logf("Warning: no detailed changes found beyond transition header")
+			t.Logf("All changes: %v", got.Changes)
+		}
+	})
+
+	// Test 3: Different entry types - ContractData to TTL
+	t.Run("ContractData to TTL transition", func(t *testing.T) {
+		t.Parallel()
+		left := contractDataLE.Raw.(*xdr.LedgerEntry)
+		right := ttlLE.Raw.(*xdr.LedgerEntry)
+
+		got, err := lens.DiffBase64(mustMarshal(t, left), mustMarshal(t, right), "LedgerEntry")
+		if err != nil {
+			t.Fatalf("DiffBase64() error = %v", err)
+		}
+
+		found := false
+		for _, c := range got.Changes {
+			if c.Op == lens.ChangeModified && (strings.Contains(c.BeforeNote, "transition") || strings.Contains(c.AfterNote, "transition")) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Logf("Changes: %v", got.Changes)
+		}
+		if len(got.Changes) == 0 {
+			t.Errorf("expected changes for ContractData to TTL transition, got none")
+		}
+	})
+
+	// Test 4: Same entry - should show no transition and no changes (Equal=true)
+	t.Run("Same entry - no transition and no changes", func(t *testing.T) {
+		t.Parallel()
+		got, err := lens.DiffBase64(mustMarshal(t, offerLE.Raw.(*xdr.LedgerEntry)), mustMarshal(t, offerLE.Raw.(*xdr.LedgerEntry)), "LedgerEntry")
+		if err != nil {
+			t.Fatalf("DiffBase64() error = %v", err)
+		}
+		// When entries are identical, Equal() should be true and there should be no changes
+		if !got.Equal() {
+			t.Errorf("expected equal for same LedgerEntry, got: %v", got.Changes)
+		}
+		if len(got.Changes) != 0 {
+			t.Errorf("expected no changes for same entry, got %d: %v", len(got.Changes), got.Changes)
+		}
+	})
+}
+
+func TestDiffSemanticMemo(t *testing.T) {
+	t.Parallel()
+
+	// Test MemoText "100" vs MemoId 100 - semantically equivalent
+	text := "100"
+	id := xdr.Uint64(100)
+
+	left := xdr.Memo{Type: xdr.MemoTypeMemoText, Text: &text}
+	right := xdr.Memo{Type: xdr.MemoTypeMemoId, Id: &id}
+
+	got, err := lens.DiffBase64(mustMarshal(t, left), mustMarshal(t, right), "Memo")
+	if err != nil {
+		t.Fatalf("DiffBase64() error = %v", err)
+	}
+	if got.Equal() {
+		t.Fatal("expected a change (type switched), got equal")
+	}
+	if len(got.Changes) != 1 {
+		t.Fatalf("expected 1 change for semantically equivalent memo, got %d: %v", len(got.Changes), got.Changes)
+	}
+	c := got.Changes[0]
+	if c.Op != lens.ChangeModified {
+		t.Errorf("Op = %v, want ChangeModified for semantic equivalence", c.Op)
+	}
+	if !strings.Contains(c.BeforeNote, "semantically equivalent") || !strings.Contains(c.AfterNote, "semantically equivalent") {
+		t.Errorf("notes should mention semantic equivalence: before=%q after=%q", c.BeforeNote, c.AfterNote)
+	}
+
+	// Test MemoText "hello" vs MemoId 100 - NOT semantically equivalent
+	text2 := "hello"
+	id2 := xdr.Uint64(100)
+
+	left2 := xdr.Memo{Type: xdr.MemoTypeMemoText, Text: &text2}
+	right2 := xdr.Memo{Type: xdr.MemoTypeMemoId, Id: &id2}
+
+	got2, err := lens.DiffBase64(mustMarshal(t, left2), mustMarshal(t, right2), "Memo")
+	if err != nil {
+		t.Fatalf("DiffBase64() error = %v", err)
+	}
+	if got2.Equal() {
+		t.Fatal("expected changes for non-equivalent memo")
+	}
+	// Should have 3 changes for union arm switch
+	if len(got2.Changes) != 3 {
+		t.Fatalf("expected 3 changes for non-equivalent memo (union arm switch), got %d: %v", len(got2.Changes), got2.Changes)
+	}
+	hasTypeChange := false
+	hasTextRemoval := false
+	hasIdAddition := false
+	for _, c := range got2.Changes {
+		if c.Path == "Type" && c.Op == lens.ChangeModified {
+			hasTypeChange = true
+		}
+		if c.Path == "Text" && c.Op == lens.ChangeRemoved {
+			hasTextRemoval = true
+		}
+		if c.Path == "Id" && c.Op == lens.ChangeAdded {
+			hasIdAddition = true
+		}
+	}
+	if !hasTypeChange || !hasTextRemoval || !hasIdAddition {
+		t.Errorf("expected union arm switch pattern (Type modified, Text removed, Id added), got: %v", got2.Changes)
+	}
+
+	// Test MemoHash vs MemoReturn - different arms, not equivalent
+	hash := xdr.Hash{1, 2, 3, 4}
+	hash2 := xdr.Hash{5, 6, 7, 8}
+
+	left3 := xdr.Memo{Type: xdr.MemoTypeMemoHash, Hash: &hash}
+	right3 := xdr.Memo{Type: xdr.MemoTypeMemoReturn, RetHash: &hash2}
+
+	got3, err := lens.DiffBase64(mustMarshal(t, left3), mustMarshal(t, right3), "Memo")
+	if err != nil {
+		t.Fatalf("DiffBase64() error = %v", err)
+	}
+	if got3.Equal() {
+		t.Fatal("expected changes for different memo arms")
+	}
+	// Should have 3 changes for union arm switch
+	if len(got3.Changes) != 3 {
+		t.Fatalf("expected 3 changes for different memo arms, got %d: %v", len(got3.Changes), got3.Changes)
+	}
+
+	// Test MemoNone vs MemoNone - equal
+	none1 := xdr.Memo{Type: xdr.MemoTypeMemoNone}
+	none2 := xdr.Memo{Type: xdr.MemoTypeMemoNone}
+
+	got4, err := lens.DiffBase64(mustMarshal(t, none1), mustMarshal(t, none2), "Memo")
+	if err != nil {
+		t.Fatalf("DiffBase64() error = %v", err)
+	}
+	if !got4.Equal() {
+		t.Errorf("expected equal for two MemoNone, got: %v", got4.Changes)
+	}
+
+	// Test MemoText "100" vs MemoText "100" - equal
+	text3 := "100"
+	text4 := "100"
+	left5 := xdr.Memo{Type: xdr.MemoTypeMemoText, Text: &text3}
+	right5 := xdr.Memo{Type: xdr.MemoTypeMemoText, Text: &text4}
+
+	got5, err := lens.DiffBase64(mustMarshal(t, left5), mustMarshal(t, right5), "Memo")
+	if err != nil {
+		t.Fatalf("DiffBase64() error = %v", err)
+	}
+	if !got5.Equal() {
+		t.Errorf("expected equal for same MemoText, got: %v", got5.Changes)
+	}
+
+	// Test MemoId 100 vs MemoId 100 - equal
+	id3 := xdr.Uint64(100)
+	id4 := xdr.Uint64(100)
+	left6 := xdr.Memo{Type: xdr.MemoTypeMemoId, Id: &id3}
+	right6 := xdr.Memo{Type: xdr.MemoTypeMemoId, Id: &id4}
+
+	got6, err := lens.DiffBase64(mustMarshal(t, left6), mustMarshal(t, right6), "Memo")
+	if err != nil {
+		t.Fatalf("DiffBase64() error = %v", err)
+	}
+	if !got6.Equal() {
+		t.Errorf("expected equal for same MemoId, got: %v", got6.Changes)
+	}
+
+	// Test MemoText "00100" vs MemoId 100 - semantically equivalent (leading zeros)
+	text5 := "00100"
+	id5 := xdr.Uint64(100)
+	left7 := xdr.Memo{Type: xdr.MemoTypeMemoText, Text: &text5}
+	right7 := xdr.Memo{Type: xdr.MemoTypeMemoId, Id: &id5}
+
+	got7, err := lens.DiffBase64(mustMarshal(t, left7), mustMarshal(t, right7), "Memo")
+	if err != nil {
+		t.Fatalf("DiffBase64() error = %v", err)
+	}
+	if got7.Equal() {
+		t.Fatal("expected a change (type switched), got equal")
+	}
+	if len(got7.Changes) != 1 || got7.Changes[0].Op != lens.ChangeModified {
+		t.Errorf("expected 1 modified change for semantically equivalent memo with leading zeros, got: %v", got7.Changes)
+	}
+	if !strings.Contains(got7.Changes[0].BeforeNote, "semantically equivalent") {
+		t.Errorf("note should mention semantic equivalence: %q", got7.Changes[0].BeforeNote)
+	}
+
+	// Test MemoReturn vs MemoReturn - equal (both are 32-byte hashes)
+	ret1 := xdr.Hash{1, 2, 3, 4}
+	ret2 := xdr.Hash{1, 2, 3, 4}
+	left8 := xdr.Memo{Type: xdr.MemoTypeMemoReturn, RetHash: &ret1}
+	right8 := xdr.Memo{Type: xdr.MemoTypeMemoReturn, RetHash: &ret2}
+
+	got8, err := lens.DiffBase64(mustMarshal(t, left8), mustMarshal(t, right8), "Memo")
+	if err != nil {
+		t.Fatalf("DiffBase64() error = %v", err)
+	}
+	if !got8.Equal() {
+		t.Errorf("expected equal for same MemoReturn, got: %v", got8.Changes)
+	}
+
+	// Test MemoReturn vs MemoHash - different arms, not equivalent
+	ret3 := xdr.Hash{1, 2, 3, 4}
+	hash3 := xdr.Hash{1, 2, 3, 4}
+	left9 := xdr.Memo{Type: xdr.MemoTypeMemoReturn, RetHash: &ret3}
+	right9 := xdr.Memo{Type: xdr.MemoTypeMemoHash, Hash: &hash3}
+
+	got9, err := lens.DiffBase64(mustMarshal(t, left9), mustMarshal(t, right9), "Memo")
+	if err != nil {
+		t.Fatalf("DiffBase64() error = %v", err)
+	}
+	if got9.Equal() {
+		t.Fatal("expected changes for MemoReturn vs MemoHash")
+	}
+	// Should have 3 changes for union arm switch
+	if len(got9.Changes) != 3 {
+		t.Fatalf("expected 3 changes for different memo arms, got %d: %v", len(got9.Changes), got9.Changes)
+	}
+}

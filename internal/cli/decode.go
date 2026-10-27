@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,27 +19,32 @@ import (
 
 func newDecodeCmd(g *globalFlags, stdout io.Writer, stdin io.Reader) *cobra.Command {
 	var (
-		asJSON       bool
-		asYAML       bool
-		isHex        bool
-		isMulti      bool
-		inspectWASM  bool
-		asSummary    bool
-		asTxRep      bool
-		asCSV        bool
-		interactive  bool
-		specPath     string
-		formatName   string
-		network      string
-		typeName     string
-		maxDepth     int
-		showTypes    bool
-		annotate     bool
-		listCands    bool
-		compactOut   bool
-		stream       bool
-		canonical    bool
-		batchPattern string
+		asJSON        bool
+		asYAML        bool
+		isHex         bool
+		isMulti       bool
+		inspectWASM   bool
+		asSummary     bool
+		asTxRep       bool
+		asCSV         bool
+		interactive   bool
+		specPath      string
+		formatName    string
+		network       string
+		typeName      string
+		maxDepth      int
+		showTypes     bool
+		annotate      bool
+		listCands     bool
+		compactOut    bool
+		stream        bool
+		canonical     bool
+		batchPattern  string
+		selectPath    string
+		rawOutput     bool
+		rawFormat     string
+		accountFilter string
+		opTypeFilter  string
 	)
 
 	cmd := &cobra.Command{
@@ -113,6 +119,9 @@ Use --interactive (or 'lens explore') for an interactive terminal tree viewer.`,
 				return runMultiStream(r, stdout, g, typeName, isHex, asJSON, asYAML, compactOut, annotate, maxDepth, showTypes)
 			}
 
+			// Helper to check if output format is tree (default)
+			isTreeFormat := !asJSON && formatName != "json" && !asYAML && !asCSV && formatName != "csv" && !asTxRep && formatName != "txrep" && !asSummary && formatName != "summary" && formatName != "html" && formatName != "mermaid"
+
 			render := func(w io.Writer, payload string) error {
 				if isHex || strings.HasPrefix(payload, "0x") || strings.HasPrefix(payload, "0X") {
 					b64, convErr := lens.HexToBase64(payload)
@@ -156,13 +165,49 @@ Use --interactive (or 'lens explore') for an interactive terminal tree viewer.`,
 					return runInspectWASM(w, value, payload, asJSON)
 				}
 
-				if asYAML {
-					yamlBytes, err := lens.ValueToYAML(value, annotate)
-					if err != nil {
-						return fmt.Errorf("formatting YAML: %w", err)
+				// Apply --select / --query path selection
+				var selectedNode *lens.Node
+				if selectPath != "" {
+					selectedNode = value.Node.Find(selectPath)
+					if selectedNode == nil {
+						return fmt.Errorf("path %q not found in decoded tree", selectPath)
 					}
-					_, err = w.Write(yamlBytes)
-					return err
+					// Create a new value with just the selected node
+					value = &lens.Value{
+						Type: value.Type,
+						Node: selectedNode,
+						Raw:  value.Raw,
+					}
+				}
+
+				// Handle --raw output (must come before scalar node check)
+				if rawOutput {
+					return handleRawOutput(w, value, selectedNode, rawFormat)
+				}
+
+				// If a scalar node was selected and we're using tree format, print it directly
+				if selectPath != "" && value.Node.Kind == lens.KindScalar && isTreeFormat {
+					palette, err := paletteForOutput(w, g.color)
+					if err != nil {
+						return err
+					}
+					return writeScalarNode(w, value.Node, palette)
+				}
+
+				// Apply --account filter
+				if accountFilter != "" {
+					value.Node = lens.FilterByAccount(value.Node, accountFilter)
+					if value.Node == nil || (value.Node.Kind == lens.KindStruct && len(value.Node.Children) == 0) {
+						return fmt.Errorf("no nodes found matching account %q", accountFilter)
+					}
+				}
+
+				// Apply --op-type filter
+				if opTypeFilter != "" {
+					value.Node = lens.FilterByOpType(value.Node, opTypeFilter)
+					if value.Node == nil || (value.Node.Kind == lens.KindStruct && len(value.Node.Children) == 0) {
+						return fmt.Errorf("no operations found matching type %q", opTypeFilter)
+					}
 				}
 
 				if specPath != "" {
@@ -180,6 +225,15 @@ Use --interactive (or 'lens explore') for an interactive terminal tree viewer.`,
 					}
 					tui := NewTUITree(value, stdin, w, palette)
 					return tui.Run()
+				}
+
+				if asYAML {
+					yamlBytes, err := lens.ValueToYAML(value, annotate)
+					if err != nil {
+						return fmt.Errorf("formatting YAML: %w", err)
+					}
+					_, err = w.Write(yamlBytes)
+					return err
 				}
 
 				if asSummary || formatName == "summary" {
@@ -215,6 +269,10 @@ Use --interactive (or 'lens explore') for an interactive terminal tree viewer.`,
 
 				if formatName == "mermaid" {
 					return format.NewMermaidFormatter().Format(w, value)
+				}
+
+				if formatName == "junit" {
+					return format.NewJUnitFormatter().Format(w, value)
 				}
 
 				if asJSON || formatName == "json" {
@@ -264,7 +322,7 @@ Use --interactive (or 'lens explore') for an interactive terminal tree viewer.`,
 	cmd.Flags().BoolVar(&asCSV, "csv", false, "emit a flat CSV row of the high-level transaction fields")
 	cmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "explore the decoded tree interactively")
 	cmd.Flags().StringVar(&specPath, "spec", "", "path to contract WASM or ScSpecEntry file for spec-aware decoding")
-	cmd.Flags().StringVar(&formatName, "format", "", `output format: "tree", "json", "summary", "txrep", "csv", "html", or "mermaid"`)
+	cmd.Flags().StringVar(&formatName, "format", "", `output format: "tree", "json", "summary", "txrep", "csv", "html", "mermaid", or "junit"`)
 	cmd.Flags().StringVar(&network, "network", "", "network passphrase for txrep formatting")
 	cmd.Flags().StringVarP(&typeName, "type", "t", "",
 		"decode as this XDR type instead of detecting it (see `lens types`)")
@@ -276,6 +334,12 @@ Use --interactive (or 'lens explore') for an interactive terminal tree viewer.`,
 	cmd.Flags().BoolVar(&canonical, "canonical", false, "verify that input adheres strictly to canonical XDR serialization")
 	cmd.Flags().StringVar(&batchPattern, "batch", "",
 		"decode every file in a directory or matching a glob pattern, with per-file headers and a failure summary")
+	cmd.Flags().StringVar(&selectPath, "select", "", "select a subtree by dotted path (e.g., Tx.Fee, Signatures[0].Hint)")
+	cmd.Flags().StringVar(&selectPath, "query", "", "alias for --select")
+	cmd.Flags().BoolVar(&rawOutput, "raw", false, "emit raw bytes or base64 of the selected node (requires --select)")
+	cmd.Flags().StringVar(&rawFormat, "raw-format", "auto", `raw output format: "auto", "base64", "hex", or "raw" (raw bytes)`)
+	cmd.Flags().StringVar(&accountFilter, "account", "", "filter tree to only show nodes involving this account strkey (G...)")
+	cmd.Flags().StringVar(&opTypeFilter, "op-type", "", "filter operations by type (e.g., payment, invoke_host_function)")
 
 	return cmd
 }
@@ -661,6 +725,85 @@ func runCandidates(stdout io.Writer, payload string) error {
 		}
 	}
 	return nil
+}
+
+// handleRawOutput emits raw bytes or base64 of the selected node.
+func handleRawOutput(w io.Writer, value *lens.Value, selectedNode *lens.Node, rawFormat string) error {
+	if selectedNode == nil {
+		return fmt.Errorf("--raw requires --select to specify a path")
+	}
+
+	var rawBytes []byte
+	var err error
+
+	// Extract from the selected node directly
+	rawBytes, _, err = lens.ExtractRawBytesFromNode(selectedNode)
+
+	if err != nil || rawBytes == nil {
+		return fmt.Errorf("could not extract raw bytes from selected node: %w", err)
+	}
+
+	// Determine output format
+	switch rawFormat {
+	case "auto":
+		// Default to base64 for binary data, raw bytes for text
+		if isPrintableASCII(rawBytes) {
+			_, err = w.Write(rawBytes)
+		} else {
+			// Default to base64 for non-text
+			encoded := base64.StdEncoding.EncodeToString(rawBytes)
+			_, err = w.Write([]byte(encoded))
+		}
+	case "base64":
+		encoded := base64.StdEncoding.EncodeToString(rawBytes)
+		_, err = w.Write([]byte(encoded))
+	case "hex":
+		encoded := hex.EncodeToString(rawBytes)
+		_, err = w.Write([]byte(encoded))
+	case "raw":
+		_, err = w.Write(rawBytes)
+	default:
+		return fmt.Errorf("invalid --raw-format: %q (valid: auto, base64, hex, raw)", rawFormat)
+	}
+
+	// Don't add trailing newline in raw mode
+	return err
+}
+
+func isPrintableASCII(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// writeScalarNode writes a scalar node directly to the output in tree format.
+func writeScalarNode(w io.Writer, n *lens.Node, palette format.Palette) error {
+	if n == nil {
+		return nil
+	}
+	// For a selected scalar, just print its value with its note if available
+	var output string
+	if n.Value != nil {
+		output = fmt.Sprintf("%v", n.Value)
+	}
+	if n.Note != "" {
+		if output != "" {
+			output += " (" + n.Note + ")"
+		} else {
+			output = n.Note
+		}
+	}
+	if output == "" {
+		output = "<empty>"
+	}
+	_, err := fmt.Fprintf(w, "%s%s\n", palette.Key, output)
+	return err
 }
 
 func newTypesCmd(stdout io.Writer) *cobra.Command {

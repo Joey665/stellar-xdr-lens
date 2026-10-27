@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/stellar-optics/stellar-xdr-lens/pkg/lens"
@@ -12,6 +13,7 @@ import (
 // DiffFormatter renders a lens.DiffResult.
 type DiffFormatter struct {
 	palette Palette
+	summary bool
 }
 
 // DiffOption configures a DiffFormatter.
@@ -20,6 +22,11 @@ type DiffOption func(*DiffFormatter)
 // WithDiffPalette sets the colour palette.
 func WithDiffPalette(p Palette) DiffOption {
 	return func(d *DiffFormatter) { d.palette = p }
+}
+
+// WithSummary enables ASCII summary table output.
+func WithSummary(enabled bool) DiffOption {
+	return func(d *DiffFormatter) { d.summary = enabled }
 }
 
 // NewDiffFormatter returns a DiffFormatter.
@@ -108,6 +115,145 @@ func (f *DiffFormatter) value(v any, note string) string {
 		return s + " " + f.palette.Note + note + f.palette.Reset
 	}
 	return s
+}
+
+// DiffSummaryFormatter renders a lens.DiffResult as a concise ASCII summary table.
+type DiffSummaryFormatter struct {
+	palette Palette
+}
+
+// DiffSummaryOption configures a DiffSummaryFormatter.
+type DiffSummaryOption func(*DiffSummaryFormatter)
+
+// WithDiffSummaryPalette sets the colour palette.
+func WithDiffSummaryPalette(p Palette) DiffSummaryOption {
+	return func(d *DiffSummaryFormatter) { d.palette = p }
+}
+
+// NewDiffSummaryFormatter returns a DiffSummaryFormatter.
+func NewDiffSummaryFormatter(opts ...DiffSummaryOption) *DiffSummaryFormatter {
+	d := &DiffSummaryFormatter{palette: NoColor}
+	for _, o := range opts {
+		o(d)
+	}
+	return d
+}
+
+// Format writes a summary table of the diff to w.
+func (f *DiffSummaryFormatter) Format(w io.Writer, d *lens.DiffResult) error {
+	if d == nil {
+		return fmt.Errorf("format: nil diff")
+	}
+	p := f.palette
+	var b strings.Builder
+
+	if d.LeftType != d.RightType {
+		fmt.Fprintf(&b, "%stype differs: %s vs %s%s\n\n", p.Change, d.LeftType, d.RightType, p.Reset)
+	} else {
+		fmt.Fprintf(&b, "%s%s%s\n\n", p.Type, d.LeftType, p.Reset)
+	}
+
+	if d.Equal() {
+		fmt.Fprintf(&b, "%sno differences%s\n", p.Add, p.Reset)
+		if len(d.Warnings) > 0 {
+			fmt.Fprintf(&b, "\n")
+			for _, warn := range d.Warnings {
+				fmt.Fprintf(&b, "%swarning: %s%s\n", p.Change, warn, p.Reset)
+			}
+		}
+		if _, err := io.WriteString(w, b.String()); err != nil {
+			return fmt.Errorf("format: write diff summary: %w", err)
+		}
+		return nil
+	}
+
+	// Group changes by top-level section
+	sectionCounts := make(map[string]map[lens.ChangeOp]int)
+	for _, c := range d.Changes {
+		section := topLevelSection(c.Path)
+		if sectionCounts[section] == nil {
+			sectionCounts[section] = make(map[lens.ChangeOp]int)
+		}
+		sectionCounts[section][c.Op]++
+	}
+
+	// Sort sections for deterministic output
+	sections := make([]string, 0, len(sectionCounts))
+	for s := range sectionCounts {
+		sections = append(sections, s)
+	}
+	sort.Strings(sections)
+
+	// Print table header
+	fmt.Fprintf(&b, "%s%-30s %8s %8s %8s %8s%s\n", p.Type, "SECTION", "ADDED", "REMOVED", "MODIFIED", "REORDERED", p.Reset)
+	fmt.Fprintf(&b, "%s%s%s\n", p.Dim, strings.Repeat("─", 70), p.Reset)
+
+	for _, section := range sections {
+		counts := sectionCounts[section]
+		added := counts[lens.ChangeAdded]
+		removed := counts[lens.ChangeRemoved]
+		modified := counts[lens.ChangeModified]
+		reordered := counts[lens.ChangeReordered]
+		typeChanged := counts[lens.ChangeTypeChanged]
+		// Combine type_changed into modified for display
+		modified += typeChanged
+
+		fmt.Fprintf(&b, "%-30s %8d %8d %8d %8d\n",
+			truncate(section, 30), added, removed, modified, reordered)
+	}
+
+	fmt.Fprintf(&b, "%s%s%s\n", p.Dim, strings.Repeat("─", 70), p.Reset)
+
+	// Totals
+	totalAdded, totalRemoved, totalModified, totalReordered := 0, 0, 0, 0
+	for _, counts := range sectionCounts {
+		totalAdded += counts[lens.ChangeAdded]
+		totalRemoved += counts[lens.ChangeRemoved]
+		totalModified += counts[lens.ChangeModified] + counts[lens.ChangeTypeChanged]
+		totalReordered += counts[lens.ChangeReordered]
+	}
+	fmt.Fprintf(&b, "%-30s %8d %8d %8d %8d\n", "TOTAL", totalAdded, totalRemoved, totalModified, totalReordered)
+
+	if len(d.Warnings) > 0 {
+		fmt.Fprintf(&b, "\n")
+		for _, warn := range d.Warnings {
+			fmt.Fprintf(&b, "%swarning: %s%s\n", p.Change, warn, p.Reset)
+		}
+	}
+
+	fmt.Fprintf(&b, "\n%s%s%s\n", p.Dim, d.Summary(), p.Reset)
+
+	if _, err := io.WriteString(w, b.String()); err != nil {
+		return fmt.Errorf("format: write diff summary: %w", err)
+	}
+	return nil
+}
+
+// topLevelSection extracts the top-level section from a path.
+func topLevelSection(path string) string {
+	if path == "" {
+		return "(root)"
+	}
+	// Split by dot, but handle bracketed indices
+	segments := strings.Split(path, ".")
+	if len(segments) == 0 {
+		return "(root)"
+	}
+	first := segments[0]
+	// If first segment contains [, it's an array at root
+	if strings.Contains(first, "[") {
+		idx := strings.Index(first, "[")
+		return first[:idx]
+	}
+	return first
+}
+
+// truncate truncates a string to maxLen characters.
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
 
 // DiffChangeDoc represents a single difference in the structured JSON diff schema.
