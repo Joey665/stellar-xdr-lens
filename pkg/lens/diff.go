@@ -45,7 +45,6 @@ const (
 	TransitionDeleted LedgerEntryTransitionType = "deleted"
 )
 
-
 func (c ChangeOp) String() string {
 	switch c {
 	case ChangeModified:
