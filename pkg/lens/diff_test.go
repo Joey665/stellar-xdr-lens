@@ -1456,3 +1456,48 @@ func TestDiffSemanticMemo(t *testing.T) {
 		t.Fatalf("expected 3 changes for different memo arms, got %d: %v", len(got9.Changes), got9.Changes)
 	}
 }
+
+func TestDiffWithOptions_MaskPaths(t *testing.T) {
+	t.Parallel()
+
+	left := &lens.Value{
+		Type: "TxEnvelope",
+		Node: &lens.Node{
+			Kind: lens.KindStruct,
+			Children: []*lens.Node{
+				{Name: "SeqNum", Kind: lens.KindScalar, Value: 100},
+				{Name: "Fee", Kind: lens.KindScalar, Value: 10},
+			},
+		},
+	}
+	right := &lens.Value{
+		Type: "TxEnvelope",
+		Node: &lens.Node{
+			Kind: lens.KindStruct,
+			Children: []*lens.Node{
+				{Name: "SeqNum", Kind: lens.KindScalar, Value: 200},
+				{Name: "Fee", Kind: lens.KindScalar, Value: 10},
+			},
+		},
+	}
+
+	// Without mask, they differ on SeqNum
+	unmasked, err := lens.DiffWithOptions(left, right, lens.DiffOptions{})
+	if err != nil {
+		t.Fatalf("DiffWithOptions() error = %v", err)
+	}
+	if unmasked.Equal() {
+		t.Fatal("expected differences without mask")
+	}
+
+	// With MaskPaths, SeqNum is excluded
+	masked, err := lens.DiffWithOptions(left, right, lens.DiffOptions{
+		MaskPaths: []string{"SeqNum"},
+	})
+	if err != nil {
+		t.Fatalf("DiffWithOptions() error = %v", err)
+	}
+	if !masked.Equal() {
+		t.Fatalf("expected Equal() with MaskPaths, got %v", masked.Changes)
+	}
+}
