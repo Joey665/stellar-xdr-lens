@@ -274,7 +274,12 @@ func buildNode(name string, rv reflect.Value, depth int) *Node {
 		n := &Node{Name: name, Kind: KindStruct, TypeName: typeName}
 		keys := rv.MapKeys()
 		sort.Slice(keys, func(i, j int) bool {
-			return fmt.Sprintf("%v", keys[i]) < fmt.Sprintf("%v", keys[j])
+			ki := fmt.Sprintf("%v", keys[i])
+			kj := fmt.Sprintf("%v", keys[j])
+			if ki != kj {
+				return ki < kj
+			}
+			return fmt.Sprintf("%T|%#v", keys[i].Interface(), keys[i].Interface()) < fmt.Sprintf("%T|%#v", keys[j].Interface(), keys[j].Interface())
 		})
 		for _, k := range keys {
 			child := buildNode(fmt.Sprintf("%v", k), rv.MapIndex(k), depth+1)

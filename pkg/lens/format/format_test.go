@@ -948,3 +948,26 @@ func TestJUnitFormatterPropagatesWriteError(t *testing.T) {
 		t.Errorf("Format() error = %v, want it to wrap %v", err, boom)
 	}
 }
+
+func TestJSONFormatterDeterministicMapKeys(t *testing.T) {
+	t.Parallel()
+
+	v := loadValue(t, "tx_success.env")
+	f := format.NewJSONFormatter()
+	var wantBuf bytes.Buffer
+	if err := f.Format(&wantBuf, v); err != nil {
+		t.Fatalf("Format() error = %v", err)
+	}
+	want := wantBuf.String()
+
+	for i := 0; i < 50; i++ {
+		vRepeat := loadValue(t, "tx_success.env")
+		var curBuf bytes.Buffer
+		if err := f.Format(&curBuf, vRepeat); err != nil {
+			t.Fatalf("Format() error = %v", err)
+		}
+		if curBuf.String() != want {
+			t.Fatalf("JSON output differs on iteration %d", i)
+		}
+	}
+}
